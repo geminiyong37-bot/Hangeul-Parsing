@@ -1,1 +1,1 @@
-# dify
+# hangeul parsing
