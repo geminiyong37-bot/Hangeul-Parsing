@@ -1,0 +1,186 @@
+import os
+import time
+import re
+from pyhwpx import Hwp
+
+hwp = Hwp()
+all_reports = []
+
+# 경로 설정
+target_folder = r"X:\3. 예결산 실태점검\2025\작업"
+
+file_list = [
+    os.path.join(target_folder, f) 
+    for f in os.listdir(target_folder) 
+    if f.endswith(('.hwp', '.hwpx')) and not f.startswith('~$')
+]
+
+print(f"검색된 파일 개수: {len(file_list)}개")
+
+# 데이터 추출을 위한 정규표현식
+univ_name_re = re.compile(r'대학명\s*\(법인명\)\s*[:：]\s*(.+)')
+finding_title_re = re.compile(r'^(\d+)\.\s+(.+)$')
+bullet_re = re.compile(r'^([❍○ㅇ])\s*(.+)$')
+
+for file in file_list:
+    file_name = os.path.basename(file)
+    print(f"진행 중: {file_name}")
+    
+    try:
+        hwp.open(file)
+        raw_data = hwp.GetTextFile("TEXT", "")
+        
+        full_text = ""
+        if isinstance(raw_data, str):
+            full_text = raw_data
+        elif isinstance(raw_data, tuple):
+            full_text = next((item for item in raw_data if isinstance(item, str)), "")
+        
+        if not full_text:
+            hwp.close()
+            continue
+            
+        lines = full_text.split('\r\n')
+        
+        report_data = {
+            "파일명": file_name,
+            "대학명": "미상",
+            "총평": [],
+            "세부내역": []
+        }
+        
+        state = "INIT"
+        expected_num = 1
+        current_finding = None
+        current_key = None
+
+        for line in lines:
+            line_clean = line.strip()
+            if not line_clean: continue
+            
+            # 1. 대학명 추출 (일반현황 부분)
+            if state in ["INIT", "GENERAL"]:
+                m_univ = univ_name_re.search(line_clean)
+                if m_univ:
+                    report_data["대학명"] = m_univ.group(1).strip()
+                    continue
+
+            # 2. 상태 전이 트리거 확인 (공백 제거 후 비교)
+            line_no_space = line_clean.replace(" ", "")
+            if line_no_space == "총평":
+                state = "OVERALL"
+                continue
+            elif "항목별점검결과요약" in line_no_space:
+                state = "SUMMARY"
+                continue
+            elif "점검결과및개선과제세부내역" in line_no_space:
+                state = "DETAIL"
+                continue
+
+            # 3. 상태별 데이터 수집
+            if state == "OVERALL":
+                report_data["총평"].append(line_clean)
+                
+            elif state == "DETAIL":
+                # 순차적 번호의 지적사항 제목 매칭 (예: "1. 적립기금 적립 및 사용 부적정")
+                m_title = finding_title_re.match(line_clean)
+                if m_title and int(m_title.group(1)) == expected_num:
+                    if current_finding:
+                        report_data["세부내역"].append(current_finding)
+                        
+                    current_finding = {
+                        "연번": expected_num,
+                        "지적사항": m_title.group(2).strip()
+                    }
+                    current_key = "기타설명"
+                    expected_num += 1
+                    continue
+                
+                if current_finding:
+                    # '❍ 시정구분 : 사후시정' 등 하위 항목 식별
+                    m_bullet = bullet_re.match(line_clean)
+                    if m_bullet:
+                        content = m_bullet.group(2).strip()
+                        # 라인 내에 콜론이 존재하면 Key-Value로 분리
+                        if ":" in content or "：" in content:
+                            parts = re.split(r'[:：]', content, 1)
+                            key = parts[0].strip()
+                            val = parts[1].strip()
+                            current_finding[key] = val
+                            current_key = key
+                        else:
+                            # 콜론이 없으면(예: '❍ 관련규정') Key만 생성하고 다음 줄부터 배열로 담음
+                            current_key = content
+                            current_finding[current_key] = []
+                    else:
+                        # 기호가 없는 본문 텍스트는 현재 열려있는 Key에 누적
+                        if current_key in current_finding:
+                            if isinstance(current_finding[current_key], list):
+                                current_finding[current_key].append(line_clean)
+                            elif isinstance(current_finding[current_key], str):
+                                current_finding[current_key] += f"\n{line_clean}"
+                        else:
+                            current_finding[current_key] = [line_clean]
+
+        # 문서 마지막의 지적사항 저장
+        if current_finding:
+            report_data["세부내역"].append(current_finding)
+
+        all_reports.append(report_data)
+        hwp.close()
+        
+    except Exception as e:
+        print(f"오류 발생({file_name}): {e}")
+        try: hwp.quit()
+        except: pass
+        time.sleep(1)
+        hwp = Hwp()
+        continue
+
+# 마크다운(.md) 파일 저장
+if all_reports:
+    save_path = os.path.join(target_folder, "실태점검_결과보고서_요약.md")
+    
+    with open(save_path, "w", encoding="utf-8") as f:
+        f.write("# 2025 예·결산 실태점검 결과 추출 요약\n\n")
+        
+        for report in all_reports:
+            f.write(f"---\n## 📁 {report['대학명']} \n*(파일명: {report['파일명']})*\n\n")
+            
+            if report["총평"]:
+                f.write("### 📝 총평\n")
+                for line in report["총평"]:
+                    f.write(f"{line}\n")
+                f.write("\n")
+                
+            f.write("### 📌 세부 지적사항\n\n")
+            if not report["세부내역"]:
+                f.write("*추출된 세부 지적사항이 없습니다.*\n\n")
+            else:
+                for item in report["세부내역"]:
+                    f.write(f"#### [{item['연번']}] {item['지적사항']}\n")
+                    
+                    # 마크다운 문서 가독성을 위해 출력 순서 고정
+                    keys_to_print = ["시정구분", "점검항목", "관련규정", "점검내용", "점검결과 발견사항", "개선방안", "기타설명"]
+                    for key in keys_to_print:
+                        if key in item:
+                            val = item[key]
+                            if not val: continue
+                            
+                            f.write(f"- **{key}**")
+                            if isinstance(val, str):
+                                if "\n" in val:
+                                    f.write(f":\n  {val.replace(chr(10), chr(10)+'  ')}\n")
+                                else:
+                                    f.write(f": {val}\n")
+                            elif isinstance(val, list):
+                                f.write(":\n")
+                                for v_line in val:
+                                    f.write(f"  {v_line}\n")
+                    f.write("\n")
+                    
+    print(f"\n★ 취합 성공! 총 {len(all_reports)}개 기관의 데이터를 MD 파일로 저장했어.")
+else:
+    print("\n! 데이터를 찾지 못했어. 보안 모듈 에러일 수 있으니 관리자 권한으로 실행해 봐.")
+
+hwp.quit()
