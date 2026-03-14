@@ -1,0 +1,182 @@
+import os
+import time
+import re
+import csv
+import shutil
+import pythoncom
+import win32com
+from pyhwpx import Hwp
+
+# COM 캐시 삭제 및 HWP 초기화 함수
+def init_hwp():
+    try:
+        os.system("taskkill /f /im hwp.exe >nul 2>&1")
+        time.sleep(1)
+        gen_path = win32com.__gen_path__
+        if os.path.exists(gen_path):
+            try: shutil.rmtree(gen_path)
+            except: pass
+        pythoncom.CoInitialize()
+        return Hwp()
+    except Exception as e:
+        print(f"HWP 초기화 실패: {e}")
+        return None
+
+hwp = init_hwp()
+all_rows = []
+
+# 새 폴더 위치
+target_folder = r"C:\Users\회계9\Desktop\새폴더"
+
+file_list = [
+    os.path.join(target_folder, f) 
+    for f in os.listdir(target_folder) 
+    if f.endswith(('.hwp', '.hwpx')) and not f.startswith('~$')
+]
+
+univ_name_re = re.compile(r'대학명\s*\(법인명\)\s*[:：]\s*(.+)')
+finding_title_re = re.compile(r'^(\d+)\.\s+(.+)$')
+bullet_re = re.compile(r'^([❍○ㅇ]|\&\#\d+\;|\*|\-)\s*(.+)$')
+
+csv_columns = ["파일명", "대학명", "연번", "지적사항", "시정구분", "점검항목", "관련규정", "점검내용", "점검결과 발견사항", "개선방안", "기타설명"]
+
+def clean_text_for_csv(text):
+    if not text: return ""
+    text = str(text).replace('&#10061;', '❍').strip()
+    if text.startswith(("-", "=", "+", "@")):
+        text = "'" + text
+    return text
+
+for file in file_list:
+    file_name = os.path.basename(file)
+    print(f"진행 중: {file_name}")
+    
+    try:
+        hwp.open(file)
+        raw_data = hwp.GetTextFile("TEXT", "")
+        
+        full_text = ""
+        if raw_data is None:
+            full_text = ""
+        elif isinstance(raw_data, str):
+            full_text = raw_data
+        elif isinstance(raw_data, (tuple, list)):
+            full_text = next((i for i in raw_data if isinstance(i, str)), "")
+        else:
+            full_text = str(raw_data)
+        
+        if not full_text:
+            hwp.close()
+            continue
+            
+        lines = full_text.split('\r\n')
+        univ_name, state = "미상", "WAITING"
+        expected_num = 1
+        current_finding = None
+        current_key = "기타설명"
+
+        for i, line in enumerate(lines):
+            # lstrip()을 사용하여 실제 눈에 보이는 빈칸 수 계산 (특수 공백 포함)
+            left_spaces_str = line[:len(line) - len(line.lstrip())]
+            
+            leading_spaces_count = 0
+            for char in left_spaces_str:
+                if char == '\t':
+                    leading_spaces_count += 4
+                elif char == '　':
+                    leading_spaces_count += 2
+                else:
+                    leading_spaces_count += 1
+
+            line_clean = line.strip()
+            if not line_clean: continue
+            
+            if state == "WAITING":
+                m_univ = univ_name_re.search(line_clean)
+                if m_univ: univ_name = m_univ.group(1).strip()
+                if "점검결과및개선과제세부내역" in line_clean.replace(" ", ""):
+                    state = "PARSING_DETAILS"
+                continue
+
+            if state == "PARSING_DETAILS":
+                m_title = finding_title_re.match(line_clean)
+                
+                is_real_title = False
+                # 조건: 번호 매칭 + 예상 연번 + 계산된 앞쪽 공백이 2칸 미만(0 또는 1칸)
+                if m_title and int(m_title.group(1)) == expected_num and leading_spaces_count < 2:
+                    if len(line_clean) < 60:
+                        next_is_consecutive = False
+                        for j in range(i + 1, len(lines)):
+                            next_line = lines[j].strip()
+                            if not next_line: continue
+                            
+                            m_next = finding_title_re.match(next_line)
+                            if m_next and int(m_next.group(1)) == expected_num + 1:
+                                next_is_consecutive = True
+                            break 
+                            
+                        if not next_is_consecutive:
+                            is_real_title = True
+                
+                if is_real_title:
+                    if current_finding: all_rows.append(current_finding)
+                    current_finding = {col: "" for col in csv_columns}
+                    current_finding.update({
+                        "파일명": file_name, 
+                        "대학명": univ_name, 
+                        "연번": str(expected_num), 
+                        "지적사항": m_title.group(2).strip()
+                    })
+                    current_key = "기타설명"
+                    expected_num += 1
+                    continue
+                
+                if current_finding:
+                    m_bullet = bullet_re.match(line_clean)
+                    content = m_bullet.group(2).strip() if m_bullet else line_clean
+                    
+                    if ":" in content or "：" in content:
+                        parts = re.split(r'[:：]', content, maxsplit=1)
+                        raw_key = parts[0].strip()
+                        val = parts[1].strip()
+                        
+                        found_col = next((c for c in csv_columns if c.replace(" ", "") in raw_key.replace(" ", "")), None)
+                        if found_col:
+                            current_key = found_col
+                            current_finding[current_key] = val
+                        else:
+                            prefix = "\n" if current_finding[current_key] else ""
+                            current_finding[current_key] = str(current_finding[current_key]) + f"{prefix}{line_clean}"
+                    else:
+                        found_col = next((c for c in csv_columns if c.replace(" ", "") == clean_text_for_csv(content).replace("'", "").replace(" ", "")), None)
+                        if found_col:
+                            current_key = found_col
+                        else:
+                            prefix = "\n" if current_finding[current_key] else ""
+                            current_finding[current_key] = str(current_finding[current_key]) + f"{prefix}{line_clean}"
+
+        if current_finding: all_rows.append(current_finding)
+        hwp.close()
+        
+    except Exception as e:
+        print(f"오류 발생({file_name}): {e}")
+        hwp = init_hwp()
+        continue
+
+if all_rows:
+    save_path = os.path.join(target_folder, "실태점검_결과보고서_정제.csv")
+    with open(save_path, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=csv_columns)
+        writer.writeheader()
+        for row in all_rows:
+            for k, v in row.items():
+                row[k] = clean_text_for_csv(v)
+        writer.writerows(all_rows)
+    print(f"\n★ 취합 성공! 총 {len(all_rows)}건의 데이터를 CSV로 저장했어.")
+else:
+    print("\n! 데이터를 찾지 못했어.")
+
+try:
+    if hwp: hwp.quit()
+except:
+    pass
