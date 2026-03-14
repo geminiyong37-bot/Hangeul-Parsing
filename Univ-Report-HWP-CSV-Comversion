@@ -71,24 +71,13 @@ for file in file_list:
             continue
             
         lines = full_text.split('\r\n')
-        # 법인명 변수 추가
+        
         univ_name, corp_name, state = "미상", "미상", "WAITING"
         expected_num = 1
         current_finding = None
         current_key = "기타설명"
 
         for i, line in enumerate(lines):
-            left_spaces_str = line[:len(line) - len(line.lstrip())]
-            
-            leading_spaces_count = 0
-            for char in left_spaces_str:
-                if char == '\t':
-                    leading_spaces_count += 4
-                elif char == '　':
-                    leading_spaces_count += 2
-                else:
-                    leading_spaces_count += 1
-
             line_clean = line.strip()
             if not line_clean: continue
             
@@ -96,7 +85,6 @@ for file in file_list:
                 m_univ = univ_name_re.search(line_clean)
                 if m_univ: 
                     raw_univ_str = m_univ.group(1).strip()
-                    # 괄호 밖(대학명)과 괄호 안(법인명) 텍스트 분리
                     m_split = re.search(r'([^\(]+)\s*\(([^)]+)\)', raw_univ_str)
                     if m_split:
                         univ_name = m_split.group(1).strip()
@@ -113,27 +101,26 @@ for file in file_list:
                 m_title = finding_title_re.match(line_clean)
                 
                 is_real_title = False
-                if m_title and int(m_title.group(1)) == expected_num and leading_spaces_count < 2:
-                    if len(line_clean) < 60:
-                        next_is_consecutive = False
-                        for j in range(i + 1, len(lines)):
-                            next_line = lines[j].strip()
-                            if not next_line: continue
-                            
-                            m_next = finding_title_re.match(next_line)
-                            if m_next and int(m_next.group(1)) == expected_num + 1:
-                                next_is_consecutive = True
-                            break 
-                            
-                        if not next_is_consecutive:
+                
+                # 정규식 패턴과 연번이 일치하는지 확인
+                if m_title and int(m_title.group(1)) == expected_num:
+                    # 다음 유효한 줄(빈 줄 제외)을 탐색
+                    for j in range(i + 1, len(lines)):
+                        next_line_clean = lines[j].strip()
+                        if not next_line_clean:
+                            continue
+                        
+                        # 다음 줄에 "시정구분" 또는 "점검항목"이 포함되어 있는지 확인
+                        if "시정구분" in next_line_clean.replace(" ", "") or "점검항목" in next_line_clean.replace(" ", ""):
                             is_real_title = True
+                        break
                 
                 if is_real_title:
                     if current_finding: all_rows.append(current_finding)
                     current_finding = {col: "" for col in csv_columns}
                     current_finding.update({
                         "파일명": file_name, 
-                        "법인명": corp_name, # 분리된 법인명 반영
+                        "법인명": corp_name,
                         "대학명": univ_name, 
                         "연번": str(expected_num), 
                         "지적사항": m_title.group(2).strip()
