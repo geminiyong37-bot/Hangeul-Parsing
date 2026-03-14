@@ -38,7 +38,8 @@ univ_name_re = re.compile(r'대학명\s*\(법인명\)\s*[:：]\s*(.+)')
 finding_title_re = re.compile(r'^(\d+)\.\s+(.+)$')
 bullet_re = re.compile(r'^([❍○ㅇ]|\&\#\d+\;|\*|\-)\s*(.+)$')
 
-csv_columns = ["파일명", "대학명", "연번", "지적사항", "시정구분", "점검항목", "관련규정", "점검내용", "점검결과 발견사항", "개선방안", "기타설명"]
+# 법인명 컬럼을 대학명 왼쪽에 추가
+csv_columns = ["파일명", "법인명", "대학명", "연번", "지적사항", "시정구분", "점검항목", "관련규정", "점검내용", "점검결과 발견사항", "개선방안", "기타설명"]
 
 def clean_text_for_csv(text):
     if not text: return ""
@@ -70,13 +71,13 @@ for file in file_list:
             continue
             
         lines = full_text.split('\r\n')
-        univ_name, state = "미상", "WAITING"
+        # 법인명 변수 추가
+        univ_name, corp_name, state = "미상", "미상", "WAITING"
         expected_num = 1
         current_finding = None
         current_key = "기타설명"
 
         for i, line in enumerate(lines):
-            # lstrip()을 사용하여 실제 눈에 보이는 빈칸 수 계산 (특수 공백 포함)
             left_spaces_str = line[:len(line) - len(line.lstrip())]
             
             leading_spaces_count = 0
@@ -93,7 +94,17 @@ for file in file_list:
             
             if state == "WAITING":
                 m_univ = univ_name_re.search(line_clean)
-                if m_univ: univ_name = m_univ.group(1).strip()
+                if m_univ: 
+                    raw_univ_str = m_univ.group(1).strip()
+                    # 괄호 밖(대학명)과 괄호 안(법인명) 텍스트 분리
+                    m_split = re.search(r'([^\(]+)\s*\(([^)]+)\)', raw_univ_str)
+                    if m_split:
+                        univ_name = m_split.group(1).strip()
+                        corp_name = m_split.group(2).strip()
+                    else:
+                        univ_name = raw_univ_str
+                        corp_name = ""
+
                 if "점검결과및개선과제세부내역" in line_clean.replace(" ", ""):
                     state = "PARSING_DETAILS"
                 continue
@@ -102,7 +113,6 @@ for file in file_list:
                 m_title = finding_title_re.match(line_clean)
                 
                 is_real_title = False
-                # 조건: 번호 매칭 + 예상 연번 + 계산된 앞쪽 공백이 2칸 미만(0 또는 1칸)
                 if m_title and int(m_title.group(1)) == expected_num and leading_spaces_count < 2:
                     if len(line_clean) < 60:
                         next_is_consecutive = False
@@ -123,6 +133,7 @@ for file in file_list:
                     current_finding = {col: "" for col in csv_columns}
                     current_finding.update({
                         "파일명": file_name, 
+                        "법인명": corp_name, # 분리된 법인명 반영
                         "대학명": univ_name, 
                         "연번": str(expected_num), 
                         "지적사항": m_title.group(2).strip()
