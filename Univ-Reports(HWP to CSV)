@@ -21,9 +21,7 @@ print(f"검색된 파일 개수: {len(file_list)}개")
 # 데이터 추출을 위한 정규표현식
 univ_name_re = re.compile(r'대학명\s*\(법인명\)\s*[:：]\s*(.+)')
 finding_title_re = re.compile(r'^(\d+)\.\s+(.+)$')
-
-# 분리해야 할 필수 키워드 감지 정규표현식
-key_re = re.compile(r'^(?:[^가-힣A-Za-z0-9\s]+)?\s*(시정구분|점검항목|관련규정|점검내용|점검결과\s*발견사항|점검결과|개선방안)(?:\s*[:：]\s*(.+))?$')
+key_re = re.compile(r'^(?:[^가-힣A-Za-z0-9\s]+)?\s*(시정구분|점검항목|관련규정|점검내용|점검절차|점검결과\s*발견사항|점검결과|개선방안)(?:\s*[:：]\s*(.+))?$')
 
 for file in file_list:
     file_name = os.path.basename(file)
@@ -58,11 +56,9 @@ for file in file_list:
         current_key = None
 
         for line in lines:
-            # HWP 변환 과정에서 생기는 깨진 HTML 기호(&#숫자;) 제거
             line_clean = re.sub(r'&#\d+;', '', line.strip()).strip()
             if not line_clean: continue
             
-            # 1. 대학명 및 법인명 추출 분리
             if state in ["INIT", "GENERAL"]:
                 m_univ = univ_name_re.search(line_clean)
                 if m_univ:
@@ -75,7 +71,6 @@ for file in file_list:
                         report_data["대학명"] = raw_name
                     continue
 
-            # 2. 상태 전이 트리거
             line_no_space = line_clean.replace(" ", "")
             if "항목별점검결과요약" in line_no_space:
                 state = "SUMMARY"
@@ -84,7 +79,6 @@ for file in file_list:
                 state = "DETAIL"
                 continue
 
-            # 3. 세부내역 수집
             if state == "DETAIL":
                 m_title = finding_title_re.match(line_clean)
                 if m_title and int(m_title.group(1)) == expected_num:
@@ -95,7 +89,7 @@ for file in file_list:
                         "연번": expected_num,
                         "지적사항": m_title.group(2).strip()
                     }
-                    current_key = None # 소제목 내용 삭제 반영 (None으로 초기화하여 무시)
+                    current_key = None
                     expected_num += 1
                     continue
                 
@@ -103,8 +97,11 @@ for file in file_list:
                     m_key = key_re.match(line_clean)
                     if m_key:
                         key = m_key.group(1).replace(" ", "")
+                        
                         if "점검결과" in key:
                             key = "점검결과 발견사항"
+                        elif key == "점검절차":  
+                            key = "점검내용"
                             
                         if m_key.group(2): 
                             val = m_key.group(2).strip()
@@ -120,7 +117,6 @@ for file in file_list:
                             elif isinstance(current_finding[current_key], str):
                                 current_finding[current_key] += f"\n{line_clean}"
 
-        # 문서 마지막의 지적사항 저장
         if current_finding:
             report_data["세부내역"].append(current_finding)
 
@@ -135,11 +131,10 @@ for file in file_list:
         hwp = Hwp()
         continue
 
-# --- CSV 파일 저장 ---
+# CSV 파일 저장
 if all_reports:
     csv_save_path = os.path.join(target_folder, "실태점검_결과보고서_요약.csv")
     
-    # 소제목_내용 필드 제거됨
     headers = [
         "학교법인명", "학교명", "연번", "지적사항",
         "시정구분", "점검항목", "관련규정", "점검내용", "점검결과 발견사항", "개선방안"
@@ -154,12 +149,21 @@ if all_reports:
             univ_name = report.get("대학명", "미상")
             
             for item in report.get("세부내역", []):
+                
                 def format_value(val):
+                    # 1. 텍스트를 먼저 하나의 문장으로 병합
                     if isinstance(val, list):
-                        return "\n".join(val)
+                        text = "\n".join(val)
                     elif isinstance(val, str):
-                        return val
-                    return ""
+                        text = val
+                    else:
+                        text = ""
+                        
+                    # 2. 전체 문장의 맨 앞부분 검사 (공백 제거 후 판단)
+                    text_stripped = text.lstrip()
+                    if text_stripped.startswith('-') or text_stripped.startswith('­'):
+                        return "'" + text_stripped
+                    return text.strip()
 
                 row = {
                     "학교법인명": corp_name,
