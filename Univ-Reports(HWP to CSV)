@@ -2,31 +2,13 @@ import os
 import time
 import re
 import csv
-import shutil
-import pythoncom
-import win32com
 from pyhwpx import Hwp
 
-# COM 캐시 삭제 및 HWP 초기화 함수
-def init_hwp():
-    try:
-        os.system("taskkill /f /im hwp.exe >nul 2>&1")
-        time.sleep(1)
-        gen_path = win32com.__gen_path__
-        if os.path.exists(gen_path):
-            try: shutil.rmtree(gen_path)
-            except: pass
-        pythoncom.CoInitialize()
-        return Hwp()
-    except Exception as e:
-        print(f"HWP 초기화 실패: {e}")
-        return None
+hwp = Hwp()
+all_reports = []
 
-hwp = init_hwp()
-all_rows = []
-
-# 새 폴더 위치
-target_folder = r"C:\Users\회계9\Desktop\새폴더"
+# 경로 설정
+target_folder = r"X:\3. 예결산 실태점검\2025\작업"
 
 file_list = [
     os.path.join(target_folder, f) 
@@ -34,19 +16,14 @@ file_list = [
     if f.endswith(('.hwp', '.hwpx')) and not f.startswith('~$')
 ]
 
+print(f"검색된 파일 개수: {len(file_list)}개")
+
+# 데이터 추출을 위한 정규표현식
 univ_name_re = re.compile(r'대학명\s*\(법인명\)\s*[:：]\s*(.+)')
 finding_title_re = re.compile(r'^(\d+)\.\s+(.+)$')
-bullet_re = re.compile(r'^([❍○ㅇ]|\&\#\d+\;|\*|\-)\s*(.+)$')
 
-# 법인명 컬럼을 대학명 왼쪽에 추가
-csv_columns = ["파일명", "법인명", "대학명", "연번", "지적사항", "시정구분", "점검항목", "관련규정", "점검내용", "점검결과 발견사항", "개선방안", "기타설명"]
-
-def clean_text_for_csv(text):
-    if not text: return ""
-    text = str(text).replace('&#10061;', '❍').strip()
-    if text.startswith(("-", "=", "+", "@")):
-        text = "'" + text
-    return text
+# 분리해야 할 필수 키워드 감지 정규표현식
+key_re = re.compile(r'^(?:[^가-힣A-Za-z0-9\s]+)?\s*(시정구분|점검항목|관련규정|점검내용|점검결과\s*발견사항|점검결과|개선방안)(?:\s*[:：]\s*(.+))?$')
 
 for file in file_list:
     file_name = os.path.basename(file)
@@ -57,14 +34,10 @@ for file in file_list:
         raw_data = hwp.GetTextFile("TEXT", "")
         
         full_text = ""
-        if raw_data is None:
-            full_text = ""
-        elif isinstance(raw_data, str):
+        if isinstance(raw_data, str):
             full_text = raw_data
-        elif isinstance(raw_data, (tuple, list)):
-            full_text = next((i for i in raw_data if isinstance(i, str)), "")
-        else:
-            full_text = str(raw_data)
+        elif isinstance(raw_data, tuple):
+            full_text = next((item for item in raw_data if isinstance(item, str)), "")
         
         if not full_text:
             hwp.close()
@@ -72,109 +45,138 @@ for file in file_list:
             
         lines = full_text.split('\r\n')
         
-        univ_name, corp_name, state = "미상", "미상", "WAITING"
+        report_data = {
+            "파일명": file_name,
+            "법인명": "미상",
+            "대학명": "미상",
+            "세부내역": []
+        }
+        
+        state = "INIT"
         expected_num = 1
         current_finding = None
-        current_key = "기타설명"
+        current_key = None
 
-        for i, line in enumerate(lines):
-            line_clean = line.strip()
+        for line in lines:
+            # HWP 변환 과정에서 생기는 깨진 HTML 기호(&#숫자;) 제거
+            line_clean = re.sub(r'&#\d+;', '', line.strip()).strip()
             if not line_clean: continue
             
-            if state == "WAITING":
+            # 1. 대학명 및 법인명 추출 분리
+            if state in ["INIT", "GENERAL"]:
                 m_univ = univ_name_re.search(line_clean)
-                if m_univ: 
-                    raw_univ_str = m_univ.group(1).strip()
-                    m_split = re.search(r'([^\(]+)\s*\(([^)]+)\)', raw_univ_str)
-                    if m_split:
-                        univ_name = m_split.group(1).strip()
-                        corp_name = m_split.group(2).strip()
+                if m_univ:
+                    raw_name = m_univ.group(1).strip()
+                    if '(' in raw_name and raw_name.endswith(')'):
+                        univ_part, found_part = raw_name.rsplit('(', 1)
+                        report_data["대학명"] = univ_part.strip()
+                        report_data["법인명"] = found_part.replace(')', '').strip()
                     else:
-                        univ_name = raw_univ_str
-                        corp_name = ""
+                        report_data["대학명"] = raw_name
+                    continue
 
-                if "점검결과및개선과제세부내역" in line_clean.replace(" ", ""):
-                    state = "PARSING_DETAILS"
+            # 2. 상태 전이 트리거
+            line_no_space = line_clean.replace(" ", "")
+            if "항목별점검결과요약" in line_no_space:
+                state = "SUMMARY"
+                continue
+            elif "점검결과및개선과제세부내역" in line_no_space:
+                state = "DETAIL"
                 continue
 
-            if state == "PARSING_DETAILS":
+            # 3. 세부내역 수집
+            if state == "DETAIL":
                 m_title = finding_title_re.match(line_clean)
-                
-                is_real_title = False
-                
-                # 정규식 패턴과 연번이 일치하는지 확인
                 if m_title and int(m_title.group(1)) == expected_num:
-                    # 다음 유효한 줄(빈 줄 제외)을 탐색
-                    for j in range(i + 1, len(lines)):
-                        next_line_clean = lines[j].strip()
-                        if not next_line_clean:
-                            continue
+                    if current_finding:
+                        report_data["세부내역"].append(current_finding)
                         
-                        # 다음 줄에 "시정구분" 또는 "점검항목"이 포함되어 있는지 확인
-                        if "시정구분" in next_line_clean.replace(" ", "") or "점검항목" in next_line_clean.replace(" ", ""):
-                            is_real_title = True
-                        break
-                
-                if is_real_title:
-                    if current_finding: all_rows.append(current_finding)
-                    current_finding = {col: "" for col in csv_columns}
-                    current_finding.update({
-                        "파일명": file_name, 
-                        "법인명": corp_name,
-                        "대학명": univ_name, 
-                        "연번": str(expected_num), 
+                    current_finding = {
+                        "연번": expected_num,
                         "지적사항": m_title.group(2).strip()
-                    })
-                    current_key = "기타설명"
+                    }
+                    current_key = None # 소제목 내용 삭제 반영 (None으로 초기화하여 무시)
                     expected_num += 1
                     continue
                 
                 if current_finding:
-                    m_bullet = bullet_re.match(line_clean)
-                    content = m_bullet.group(2).strip() if m_bullet else line_clean
-                    
-                    if ":" in content or "：" in content:
-                        parts = re.split(r'[:：]', content, maxsplit=1)
-                        raw_key = parts[0].strip()
-                        val = parts[1].strip()
-                        
-                        found_col = next((c for c in csv_columns if c.replace(" ", "") in raw_key.replace(" ", "")), None)
-                        if found_col:
-                            current_key = found_col
-                            current_finding[current_key] = val
-                        else:
-                            prefix = "\n" if current_finding[current_key] else ""
-                            current_finding[current_key] = str(current_finding[current_key]) + f"{prefix}{line_clean}"
+                    m_key = key_re.match(line_clean)
+                    if m_key:
+                        key = m_key.group(1).replace(" ", "")
+                        if "점검결과" in key:
+                            key = "점검결과 발견사항"
+                            
+                        if m_key.group(2): 
+                            val = m_key.group(2).strip()
+                            current_finding[key] = val
+                            current_key = key
+                        else: 
+                            current_key = key
+                            current_finding[current_key] = []
                     else:
-                        found_col = next((c for c in csv_columns if c.replace(" ", "") == clean_text_for_csv(content).replace("'", "").replace(" ", "")), None)
-                        if found_col:
-                            current_key = found_col
-                        else:
-                            prefix = "\n" if current_finding[current_key] else ""
-                            current_finding[current_key] = str(current_finding[current_key]) + f"{prefix}{line_clean}"
+                        if current_key:
+                            if isinstance(current_finding[current_key], list):
+                                current_finding[current_key].append(line_clean)
+                            elif isinstance(current_finding[current_key], str):
+                                current_finding[current_key] += f"\n{line_clean}"
 
-        if current_finding: all_rows.append(current_finding)
+        # 문서 마지막의 지적사항 저장
+        if current_finding:
+            report_data["세부내역"].append(current_finding)
+
+        all_reports.append(report_data)
         hwp.close()
         
     except Exception as e:
         print(f"오류 발생({file_name}): {e}")
-        hwp = init_hwp()
+        try: hwp.quit()
+        except: pass
+        time.sleep(1)
+        hwp = Hwp()
         continue
 
-if all_rows:
-    save_path = os.path.join(target_folder, "실태점검_결과보고서_정제.csv")
-    with open(save_path, "w", encoding="utf-8-sig", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=csv_columns)
+# --- CSV 파일 저장 ---
+if all_reports:
+    csv_save_path = os.path.join(target_folder, "실태점검_결과보고서_요약.csv")
+    
+    # 소제목_내용 필드 제거됨
+    headers = [
+        "학교법인명", "학교명", "연번", "지적사항",
+        "시정구분", "점검항목", "관련규정", "점검내용", "점검결과 발견사항", "개선방안"
+    ]
+    
+    with open(csv_save_path, mode="w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=headers)
         writer.writeheader()
-        for row in all_rows:
-            for k, v in row.items():
-                row[k] = clean_text_for_csv(v)
-        writer.writerows(all_rows)
-    print(f"\n★ 취합 성공! 총 {len(all_rows)}건의 데이터를 CSV로 저장했어.")
-else:
-    print("\n! 데이터를 찾지 못했어.")
+        
+        for report in all_reports:
+            corp_name = report.get("법인명", "미상")
+            univ_name = report.get("대학명", "미상")
+            
+            for item in report.get("세부내역", []):
+                def format_value(val):
+                    if isinstance(val, list):
+                        return "\n".join(val)
+                    elif isinstance(val, str):
+                        return val
+                    return ""
 
-try:
-    if hwp: hwp.quit()
-except:
-    pass
+                row = {
+                    "학교법인명": corp_name,
+                    "학교명": univ_name,
+                    "연번": item.get("연번", ""),
+                    "지적사항": item.get("지적사항", ""),
+                    "시정구분": format_value(item.get("시정구분")),
+                    "점검항목": format_value(item.get("점검항목")),
+                    "관련규정": format_value(item.get("관련규정")),
+                    "점검내용": format_value(item.get("점검내용")),
+                    "점검결과 발견사항": format_value(item.get("점검결과 발견사항")),
+                    "개선방안": format_value(item.get("개선방안"))
+                }
+                writer.writerow(row)
+                
+    print(f"\n취합 완료. 총 {len(all_reports)}개 기관의 데이터를 CSV 파일로 저장했어.")
+else:
+    print("\n데이터를 찾지 못했어. 관리자 권한으로 실행해 봐.")
+
+hwp.quit()
